@@ -747,25 +747,47 @@ class _TrainableTritonArticleAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: Tensor):
         q, k, v = ctx.saved_tensors
+        q3, k3, v3, original_shape, had_bh = _flatten_bh_qkv(q, k, v)
+        if had_bh:
+            b, h, n, _ = original_shape
+            grad3 = grad_out.contiguous().view(b * h, n, grad_out.shape[-1])
+        else:
+            grad3 = grad_out[None, :, :].contiguous()
+        grad_q3 = torch.empty_like(q3)
+        grad_k3 = torch.empty_like(k3)
+        grad_v3 = torch.empty_like(v3)
+
+        # The Triton article kernel is forward-only.  Use the differentiable
+        # streaming/article formula as the backward surrogate, but process one
+        # flattened batch-head stream at a time so the Taylor-state autograd graph
+        # does not scale with B * H.
         with torch.enable_grad():
-            q_req = q.detach().requires_grad_(True)
-            k_req = k.detach().requires_grad_(True)
-            v_req = v.detach().requires_grad_(True)
-            surrogate = _torch_segment_mean_article_attention(
-                q_req,
-                k_req,
-                v_req,
-                degree=ctx.degree,
-                block_size=ctx.block_size,
-                compress_stride=ctx.compress_stride,
-                denominator_eps=ctx.denominator_eps,
-            )
-            grad_q, grad_k, grad_v = torch.autograd.grad(
-                surrogate,
-                (q_req, k_req, v_req),
-                grad_out,
-                allow_unused=True,
-            )
+            for seq in range(q3.shape[0]):
+                q_req = q3[seq].detach().requires_grad_(True)
+                k_req = k3[seq].detach().requires_grad_(True)
+                v_req = v3[seq].detach().requires_grad_(True)
+                surrogate = _torch_segment_mean_article_attention(
+                    q_req,
+                    k_req,
+                    v_req,
+                    degree=ctx.degree,
+                    block_size=ctx.block_size,
+                    compress_stride=ctx.compress_stride,
+                    denominator_eps=ctx.denominator_eps,
+                )
+                grad_q, grad_k, grad_v = torch.autograd.grad(
+                    surrogate,
+                    (q_req, k_req, v_req),
+                    grad3[seq],
+                    allow_unused=True,
+                )
+                grad_q3[seq] = grad_q if grad_q is not None else torch.zeros_like(q_req)
+                grad_k3[seq] = grad_k if grad_k is not None else torch.zeros_like(k_req)
+                grad_v3[seq] = grad_v if grad_v is not None else torch.zeros_like(v_req)
+
+        grad_q = _unflatten_output(grad_q3, original_shape, had_bh)
+        grad_k = _unflatten_output(grad_k3, original_shape, had_bh)
+        grad_v = _unflatten_output(grad_v3, original_shape, had_bh)
         return grad_q, grad_k, grad_v, None, None, None, None
 
 
