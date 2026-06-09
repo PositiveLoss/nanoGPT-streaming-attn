@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -80,18 +81,30 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.attention_impl == 'fast_article':
-            y = fast_article_causal_attention(
-                q,
-                k,
-                v,
-                degree=self.article_degree,
-                block_size=self.article_block_size,
-                compressor=self.article_compressor,
-                seed=self.article_seed,
-                query_chunk_size=self.article_query_chunk_size,
-                low_mode=self.article_low_mode,
-                denominator_eps=self.article_denominator_eps,
-            )
+            article_inference = not (self.training and torch.is_grad_enabled())
+            if article_inference and T <= self.article_block_size:
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+                )
+            else:
+                q_article = q.float() if article_inference else q
+                k_article = k.float() if article_inference else k
+                v_article = v.float() if article_inference else v
+                article_ctx = torch.amp.autocast(device_type=q.device.type, enabled=False) if article_inference else nullcontext()
+                with article_ctx:
+                    y = fast_article_causal_attention(
+                        q_article,
+                        k_article,
+                        v_article,
+                        degree=self.article_degree,
+                        block_size=self.article_block_size,
+                        compressor=self.article_compressor,
+                        seed=self.article_seed,
+                        query_chunk_size=self.article_query_chunk_size,
+                        low_mode=self.article_low_mode,
+                        denominator_eps=self.article_denominator_eps,
+                    )
+                y = y.to(q.dtype)
         elif self.attention_impl == 'triton_article':
             if self.training and torch.is_grad_enabled():
                 y = trainable_triton_article_causal_attention(
@@ -105,16 +118,26 @@ class CausalSelfAttention(nn.Module):
                     backward_impl=self.triton_backward,
                 )
             else:
-                y = triton_article_causal_attention(
-                    q,
-                    k,
-                    v,
-                    degree=self.article_degree,
-                    block_size=self.article_block_size,
-                    compress_stride=self.triton_compress_stride,
-                    denominator_eps=self.article_denominator_eps,
-                    output_dtype=q.dtype,
-                )
+                if T <= self.article_block_size:
+                    y = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+                    )
+                else:
+                    q_article = q.float()
+                    k_article = k.float()
+                    v_article = v.float()
+                    with torch.amp.autocast(device_type=q.device.type, enabled=False):
+                        y = triton_article_causal_attention(
+                            q_article,
+                            k_article,
+                            v_article,
+                            degree=self.article_degree,
+                            block_size=self.article_block_size,
+                            compress_stride=self.triton_compress_stride,
+                            denominator_eps=self.article_denominator_eps,
+                            output_dtype=torch.float32,
+                        )
+                    y = y.to(q.dtype)
         elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)

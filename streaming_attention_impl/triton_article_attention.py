@@ -326,11 +326,11 @@ if triton is not None and tl is not None:
                 other=0.0,
             ).to(tl.float32)
 
-            x = tl.dot(q, tl.trans(k), input_precision="tf32") * SCALE
+            x = tl.dot(q, tl.trans(k), input_precision="ieee") * SCALE
             causal = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < N) & (offs_m[:, None] < N)
             taylor = tl.where(causal, _taylor_poly(x, DEGREE), 0.0)
             low_den += tl.sum(taylor, axis=1)
-            low_acc += tl.dot(taylor, v, input_precision="tf32")
+            low_acc += tl.dot(taylor, v, input_precision="ieee")
 
             same_article_block = (offs_n[None, :] // ARTICLE_BLOCK_SIZE) == (offs_m[:, None] // ARTICLE_BLOCK_SIZE)
             local_residual_mask = causal & same_article_block
@@ -339,7 +339,7 @@ if triton is not None and tl is not None:
             exp_x = tl.exp(tl.minimum(x, 80.0))
             residual = tl.where(local_residual_mask, exp_x - _taylor_poly(x, DEGREE), 0.0)
             tail_den += tl.sum(residual, axis=1)
-            tail_acc += tl.dot(residual, v, input_precision="tf32")
+            tail_acc += tl.dot(residual, v, input_precision="ieee")
 
         # Residual for completed previous blocks, using compressed reps.
         for start_r in tl.range(0, R, BLOCK_R, num_stages=3):
@@ -355,14 +355,14 @@ if triton is not None and tl is not None:
                 other=0.0,
             ).to(tl.float32)
 
-            x = tl.dot(q, tl.trans(rk), input_precision="tf32") * SCALE
+            x = tl.dot(q, tl.trans(rk), input_precision="ieee") * SCALE
             rep_block = offs_r // REPS_PER_BLOCK
             active_from = (rep_block + 1) * ARTICLE_BLOCK_SIZE
             active = (offs_m[:, None] >= active_from[None, :]) & (offs_m[:, None] < N) & (offs_r[None, :] < R)
             exp_x = tl.exp(tl.minimum(x, 80.0))
             residual = tl.where(active, exp_x - _taylor_poly(x, DEGREE), 0.0) * COMPRESS_STRIDE
             tail_den += tl.sum(residual, axis=1)
-            tail_acc += tl.dot(residual, rv, input_precision="tf32")
+            tail_acc += tl.dot(residual, rv, input_precision="ieee")
 
         den = low_den + tail_den
         acc = low_acc + tail_acc
