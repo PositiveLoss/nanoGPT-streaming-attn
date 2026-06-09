@@ -47,6 +47,7 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.block_size = config.block_size
         self.dropout = config.dropout
         self.attention_impl = config.attention_impl
         self.article_degree = config.article_degree
@@ -134,6 +135,7 @@ class CausalSelfAttention(nn.Module):
                             degree=self.article_degree,
                             block_size=self.article_block_size,
                             compress_stride=self.triton_compress_stride,
+                            compile_n=self.block_size,
                             denominator_eps=self.article_denominator_eps,
                             output_dtype=torch.float32,
                         )

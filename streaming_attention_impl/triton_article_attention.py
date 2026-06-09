@@ -276,7 +276,8 @@ if triton is not None and tl is not None:
         RK,
         RV,
         O,
-        N: tl.constexpr,
+        N_ACTUAL,
+        N_CTX: tl.constexpr,
         D: tl.constexpr,
         DV: tl.constexpr,
         R: tl.constexpr,
@@ -301,8 +302,8 @@ if triton is not None and tl is not None:
         offs_dv = pid_dv * BLOCK_DV + tl.arange(0, BLOCK_DV)
 
         q = tl.load(
-            Q + pid_bh * N * D + offs_m[:, None] * D + offs_d[None, :],
-            mask=(offs_m[:, None] < N) & (offs_d[None, :] < D),
+            Q + pid_bh * N_CTX * D + offs_m[:, None] * D + offs_d[None, :],
+            mask=(offs_m[:, None] < N_ACTUAL) & (offs_d[None, :] < D),
             other=0.0,
         ).to(tl.float32)
 
@@ -313,21 +314,21 @@ if triton is not None and tl is not None:
 
         # Exact low-degree Taylor term against the full causal prefix, plus exact
         # residual within the current article block.
-        for start_n in tl.range(0, N, BLOCK_N, num_stages=3):
+        for start_n in tl.range(0, N_CTX, BLOCK_N, num_stages=3):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             k = tl.load(
-                K + pid_bh * N * D + offs_n[:, None] * D + offs_d[None, :],
-                mask=(offs_n[:, None] < N) & (offs_d[None, :] < D),
+                K + pid_bh * N_CTX * D + offs_n[:, None] * D + offs_d[None, :],
+                mask=(offs_n[:, None] < N_ACTUAL) & (offs_d[None, :] < D),
                 other=0.0,
             ).to(tl.float32)
             v = tl.load(
-                V + pid_bh * N * DV + offs_n[:, None] * DV + offs_dv[None, :],
-                mask=(offs_n[:, None] < N) & (offs_dv[None, :] < DV),
+                V + pid_bh * N_CTX * DV + offs_n[:, None] * DV + offs_dv[None, :],
+                mask=(offs_n[:, None] < N_ACTUAL) & (offs_dv[None, :] < DV),
                 other=0.0,
             ).to(tl.float32)
 
             x = tl.dot(q, tl.trans(k), input_precision="ieee") * SCALE
-            causal = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < N) & (offs_m[:, None] < N)
+            causal = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < N_ACTUAL) & (offs_m[:, None] < N_ACTUAL)
             taylor = tl.where(causal, _taylor_poly(x, DEGREE), 0.0)
             low_den += tl.sum(taylor, axis=1)
             low_acc += tl.dot(taylor, v, input_precision="ieee")
@@ -358,7 +359,7 @@ if triton is not None and tl is not None:
             x = tl.dot(q, tl.trans(rk), input_precision="ieee") * SCALE
             rep_block = offs_r // REPS_PER_BLOCK
             active_from = (rep_block + 1) * ARTICLE_BLOCK_SIZE
-            active = (offs_m[:, None] >= active_from[None, :]) & (offs_m[:, None] < N) & (offs_r[None, :] < R)
+            active = (offs_m[:, None] >= active_from[None, :]) & (offs_m[:, None] < N_ACTUAL) & (offs_r[None, :] < R)
             exp_x = tl.exp(tl.minimum(x, 80.0))
             residual = tl.where(active, exp_x - _taylor_poly(x, DEGREE), 0.0) * COMPRESS_STRIDE
             tail_den += tl.sum(residual, axis=1)
@@ -369,9 +370,9 @@ if triton is not None and tl is not None:
         out = acc / tl.maximum(den[:, None], DENOM_EPS)
 
         tl.store(
-            O + pid_bh * N * DV + offs_m[:, None] * DV + offs_dv[None, :],
+            O + pid_bh * N_CTX * DV + offs_m[:, None] * DV + offs_dv[None, :],
             out,
-            mask=(offs_m[:, None] < N) & (offs_dv[None, :] < DV),
+            mask=(offs_m[:, None] < N_ACTUAL) & (offs_dv[None, :] < DV),
         )
 
 
@@ -704,6 +705,7 @@ def triton_article_causal_attention(
     block_n: int = 64,
     block_r: int = 64,
     value_block: Optional[int] = None,
+    compile_n: Optional[int] = None,
     denominator_eps: float = 1.0e-12,
     output_dtype: Optional[torch.dtype] = torch.float32,
     return_stats: bool = False,
@@ -723,6 +725,10 @@ def triton_article_causal_attention(
             tiles, and residual-representative tiles.
         value_block: value-dimension tile size.  Defaults to the next power of
             two of Dv, capped at 64.
+        compile_n: optional fixed compile-time sequence length.  This is useful
+            during autoregressive sampling, where the active sequence grows one
+            token at a time; the kernel compiles for `compile_n` and masks rows
+            and keys beyond the real active length.
         output_dtype: dtype of the output tensor.  `torch.float32` is the default
             because the kernel accumulates in fp32.  Pass `q.dtype` to store half
             precision outputs.
@@ -741,6 +747,9 @@ def triton_article_causal_attention(
     _require_cuda(q3, k3, v3)
     bh, n, dim = q3.shape
     dv = v3.shape[-1]
+    n_ctx = int(compile_n or n)
+    if n_ctx < n:
+        raise ValueError("compile_n must be >= the active sequence length")
     if dim > 128:
         raise ValueError("this compact kernel supports D <= 128; increase BLOCK_D logic for larger heads")
     if dv > 256:
@@ -765,6 +774,15 @@ def triton_article_causal_attention(
     )
     r = rep_k.shape[1]
 
+    if n_ctx != n:
+        q_padded = torch.zeros((bh, n_ctx, dim), device=q3.device, dtype=q3.dtype)
+        k_padded = torch.zeros((bh, n_ctx, dim), device=k3.device, dtype=k3.dtype)
+        v_padded = torch.zeros((bh, n_ctx, dv), device=v3.device, dtype=v3.dtype)
+        q_padded[:, :n, :] = q3
+        k_padded[:, :n, :] = k3
+        v_padded[:, :n, :] = v3
+        q3, k3, v3 = q_padded, k_padded, v_padded
+
     block_d = max(16, _next_power_of_2(dim))
     if value_block is None:
         block_dv = min(64, max(16, _next_power_of_2(dv)))
@@ -774,9 +792,9 @@ def triton_article_causal_attention(
 
     s = _attention_scale(scale, dim)
     out_dtype = output_dtype or torch.float32
-    out3 = torch.empty((bh, n, dv), device=q3.device, dtype=out_dtype)
+    out3 = torch.empty((bh, n_ctx, dv), device=q3.device, dtype=out_dtype)
 
-    grid = (_ceil_div(n, block_m), bh, _ceil_div(dv, block_dv))
+    grid = (_ceil_div(n_ctx, block_m), bh, _ceil_div(dv, block_dv))
     assert _article_direct_kernel is not None
     _article_direct_kernel[grid](
         q3,
@@ -785,7 +803,8 @@ def triton_article_causal_attention(
         rep_k,
         rep_v,
         out3,
-        N=n,
+        n,
+        N_CTX=n_ctx,
         D=dim,
         DV=dv,
         R=r,
@@ -804,7 +823,7 @@ def triton_article_causal_attention(
         num_stages=3,
     )
 
-    out = _unflatten_output(out3, original_shape, had_bh)
+    out = _unflatten_output(out3[:, :n, :], original_shape, had_bh)
     if not return_stats:
         return out
 
