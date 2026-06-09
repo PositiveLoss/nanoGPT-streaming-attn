@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from streaming_attention_impl.fast_article_attention import fast_article_causal_attention
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -41,10 +43,22 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.attention_impl = config.attention_impl
+        self.article_degree = config.article_degree
+        self.article_block_size = config.article_block_size
+        self.article_compressor = config.article_compressor
+        self.article_seed = config.article_seed
+        self.article_query_chunk_size = config.article_query_chunk_size
+        self.article_low_mode = config.article_low_mode
+        self.article_denominator_eps = config.article_denominator_eps
+        if self.attention_impl not in {'flash', 'manual', 'fast_article'}:
+            raise ValueError("attention_impl must be one of {'flash', 'manual', 'fast_article'}")
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
+        self.flash = self.attention_impl == 'flash' and hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        needs_manual_mask = self.attention_impl == 'manual' or (self.attention_impl == 'flash' and not self.flash)
+        if self.attention_impl == 'flash' and not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        if needs_manual_mask:
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
@@ -59,7 +73,20 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if self.attention_impl == 'fast_article':
+            y = fast_article_causal_attention(
+                q,
+                k,
+                v,
+                degree=self.article_degree,
+                block_size=self.article_block_size,
+                compressor=self.article_compressor,
+                seed=self.article_seed,
+                query_chunk_size=self.article_query_chunk_size,
+                low_mode=self.article_low_mode,
+                denominator_eps=self.article_denominator_eps,
+            )
+        elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
@@ -114,6 +141,14 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    attention_impl: str = 'flash' # 'flash', 'manual', or 'fast_article'
+    article_degree: int = 2
+    article_block_size: int = 128
+    article_compressor: str = 'sorted_pair' # 'sorted_pair', 'random', or 'none'
+    article_seed: int = 0
+    article_query_chunk_size: int = 2048
+    article_low_mode: str = 'auto' # 'auto', 'stream', or 'prefix'
+    article_denominator_eps: float = 1e-12
 
 class GPT(nn.Module):
 
@@ -207,8 +242,9 @@ class GPT(nn.Module):
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        # runtime attention settings can be overridden along with dropout
+        allowed_override_args = {'dropout', 'attention_impl', 'article_degree', 'article_block_size', 'article_compressor', 'article_seed', 'article_query_chunk_size', 'article_low_mode', 'article_denominator_eps'}
+        assert all(k in allowed_override_args for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -223,10 +259,10 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
+        # we can override runtime/config options if desired
+        for key, value in override_args.items():
+            print(f"overriding {key} to {value}")
+            config_args[key] = value
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)

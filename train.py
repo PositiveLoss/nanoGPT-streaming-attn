@@ -54,6 +54,15 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# attention implementation
+attention_impl = 'flash' # 'flash', 'manual', or 'fast_article'
+article_degree = 2
+article_block_size = 128
+article_compressor = 'sorted_pair' # 'sorted_pair', 'random', or 'none'
+article_seed = 0
+article_query_chunk_size = 2048
+article_low_mode = 'auto' # 'auto', 'stream', or 'prefix'
+article_denominator_eps = 1e-12
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -145,7 +154,11 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, attention_impl=attention_impl,
+                  article_degree=article_degree, article_block_size=article_block_size,
+                  article_compressor=article_compressor, article_seed=article_seed,
+                  article_query_chunk_size=article_query_chunk_size, article_low_mode=article_low_mode,
+                  article_denominator_eps=article_denominator_eps) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -181,7 +194,17 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
+    override_args = dict(
+        dropout=dropout,
+        attention_impl=attention_impl,
+        article_degree=article_degree,
+        article_block_size=article_block_size,
+        article_compressor=article_compressor,
+        article_seed=article_seed,
+        article_query_chunk_size=article_query_chunk_size,
+        article_low_mode=article_low_mode,
+        article_denominator_eps=article_denominator_eps,
+    )
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
