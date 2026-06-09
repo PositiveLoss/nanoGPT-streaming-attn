@@ -282,6 +282,50 @@ def low_degree_taylor_causal_sums(
     raise ValueError("mode must be one of {'auto', 'stream', 'prefix'}")
 
 
+def low_degree_taylor_causal_sums_batched_stream(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    degree: int = 2,
+    scale: Optional[float] = None,
+) -> Tuple[Tensor, Tensor, int]:
+    """Exact causal Taylor sums for [M,N,D] tensors, batched over M.
+
+    This keeps streaming Taylor state but updates all flattened batch/head
+    streams in one tensor operation per token instead of looping in Python over
+    every stream.
+    """
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("low_degree_taylor_causal_sums_batched_stream expects [M,N,D], [M,N,D], [M,N,Dv]")
+    if q.shape != k.shape or v.shape[:2] != k.shape[:2]:
+        raise ValueError("q/k must match and v must share [M,N]")
+
+    streams, n, dim = q.shape
+    value_dim = v.shape[-1]
+    s = _attention_scale(scale, dim)
+    q_eff = q * s
+
+    f_key = _taylor_features_degree012(k, degree, key_side=True)
+    f_query = _taylor_features_degree012(q_eff, degree, key_side=False)
+    feature_count = int(f_key.shape[-1])
+
+    den_state = torch.zeros(streams, feature_count, device=q.device, dtype=q.dtype)
+    num_state = torch.zeros(streams, feature_count, value_dim, device=q.device, dtype=q.dtype)
+    low_den_steps: List[Tensor] = []
+    low_num_steps: List[Tensor] = []
+
+    for i in range(n):
+        fi = f_key[:, i]
+        den_state = den_state + fi
+        num_state = num_state + fi[:, :, None] * v[:, i, None, :]
+        qi = f_query[:, i]
+        low_den_steps.append((qi * den_state).sum(dim=-1))
+        low_num_steps.append(torch.bmm(qi[:, None, :], num_state).squeeze(1))
+
+    return torch.stack(low_num_steps, dim=1), torch.stack(low_den_steps, dim=1), feature_count
+
+
 # -----------------------------------------------------------------------------
 # Fast block residual coreset
 # -----------------------------------------------------------------------------
@@ -507,6 +551,107 @@ def _block_coreset_residual_tail(
     return tail_num, tail_den, int(reps.weights.numel()), max_block_scratch
 
 
+def _batched_segment_mean_reps(
+    k: Tensor,
+    v: Tensor,
+    *,
+    block_size: int,
+    compress_stride: int,
+) -> Tuple[Tensor, Tensor, int]:
+    """Deterministic completed-block reps for [M,N,D] tensors."""
+    streams, n, dim = k.shape
+    value_dim = v.shape[-1]
+    reps_per_block = block_size // compress_stride
+    completed_blocks = max(0, (n - 1) // block_size)
+    if completed_blocks == 0:
+        return (
+            torch.empty(streams, 0, dim, device=k.device, dtype=k.dtype),
+            torch.empty(streams, 0, value_dim, device=v.device, dtype=v.dtype),
+            reps_per_block,
+        )
+
+    usable = completed_blocks * block_size
+    rep_k = k[:, :usable].reshape(streams, completed_blocks, reps_per_block, compress_stride, dim).mean(dim=3)
+    rep_v = v[:, :usable].reshape(streams, completed_blocks, reps_per_block, compress_stride, value_dim).mean(dim=3)
+    return (
+        rep_k.reshape(streams, completed_blocks * reps_per_block, dim).contiguous(),
+        rep_v.reshape(streams, completed_blocks * reps_per_block, value_dim).contiguous(),
+        reps_per_block,
+    )
+
+
+def _batched_article_residual_tail(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    degree: int,
+    block_size: int,
+    scale: float,
+    compressor: str,
+    query_chunk_size: int,
+) -> Tuple[Tensor, Tensor, int]:
+    """Batched residual tail for [M,N,D] tensors.
+
+    For compressed modes this uses deterministic segment-mean reps with stride 2,
+    matching the Triton article path.  `compressor="none"` keeps the completed
+    prefix residual exact.
+    """
+    streams, n, _ = q.shape
+    value_dim = v.shape[-1]
+    tail_den = torch.zeros(streams, n, device=q.device, dtype=q.dtype)
+    tail_num = torch.zeros(streams, n, value_dim, device=q.device, dtype=q.dtype)
+
+    if compressor == "none":
+        key_pos = torch.arange(n, device=q.device)
+        for start in range(0, n, query_chunk_size):
+            end = min(start + query_chunk_size, n)
+            logits = torch.bmm(q[:, start:end], k.transpose(1, 2)) * scale
+            residual = torch.exp(torch.clamp(logits, max=80.0)) - exp_taylor(logits, degree)
+            query_pos = torch.arange(start, end, device=q.device)
+            causal = key_pos[None, :] <= query_pos[:, None]
+            residual = residual.masked_fill(~causal[None, :, :], 0.0)
+            tail_den[:, start:end] = tail_den[:, start:end] + residual.sum(dim=-1)
+            tail_num[:, start:end] = tail_num[:, start:end] + torch.bmm(residual, v)
+        coreset_items = n
+    else:
+        compress_stride = 2
+        if block_size % compress_stride != 0:
+            raise ValueError("batched compressed article attention requires block_size divisible by 2")
+        rep_k, rep_v, reps_per_block = _batched_segment_mean_reps(
+            k,
+            v,
+            block_size=block_size,
+            compress_stride=compress_stride,
+        )
+        coreset_items = rep_k.shape[1]
+        if coreset_items > 0:
+            rep_block = torch.arange(coreset_items, device=q.device) // reps_per_block
+            active_from = (rep_block + 1) * block_size
+            for start in range(0, n, query_chunk_size):
+                end = min(start + query_chunk_size, n)
+                logits = torch.bmm(q[:, start:end], rep_k.transpose(1, 2)) * scale
+                residual = torch.exp(torch.clamp(logits, max=80.0)) - exp_taylor(logits, degree)
+                query_pos = torch.arange(start, end, device=q.device)
+                active = query_pos[:, None] >= active_from[None, :]
+                residual = residual.masked_fill(~active[None, :, :], 0.0) * float(compress_stride)
+                tail_den[:, start:end] = tail_den[:, start:end] + residual.sum(dim=-1)
+                tail_num[:, start:end] = tail_num[:, start:end] + torch.bmm(residual, rep_v)
+
+    if compressor != "none":
+        for start in range(0, n, block_size):
+            end = min(start + block_size, n)
+            bs = end - start
+            logits = torch.bmm(q[:, start:end], k[:, start:end].transpose(1, 2)) * scale
+            residual = torch.exp(torch.clamp(logits, max=80.0)) - exp_taylor(logits, degree)
+            causal = torch.ones(bs, bs, device=q.device, dtype=torch.bool).tril()
+            residual = residual.masked_fill(~causal[None, :, :], 0.0)
+            tail_den[:, start:end] = tail_den[:, start:end] + residual.sum(dim=-1)
+            tail_num[:, start:end] = tail_num[:, start:end] + torch.bmm(residual, v[:, start:end])
+
+    return tail_num, tail_den, int(coreset_items)
+
+
 # -----------------------------------------------------------------------------
 # Public fast attention function
 # -----------------------------------------------------------------------------
@@ -623,6 +768,93 @@ def fast_article_causal_attention_single(
     return out, stats
 
 
+def fast_article_causal_attention_batched(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    degree: int = 2,
+    block_size: int = 128,
+    scale: Optional[float] = None,
+    compressor: str = "sorted_pair",
+    query_chunk_size: int = 2048,
+    stream_chunk_size: Optional[int] = None,
+    denominator_eps: float = 1e-12,
+) -> Tensor:
+    """Fast approximate causal attention for [B,H,N,D] without B/H loops.
+
+    Compressed modes use deterministic segment-mean reps, which is the same
+    execution shape as the Triton article path.  Use `compressor="none"` for an
+    exact residual tail.
+    """
+    if q.ndim != 4:
+        raise ValueError("batched fast article attention expects [B,H,N,D]")
+    if q.shape != k.shape:
+        raise ValueError("q and k must have identical shape [B,H,N,D]")
+    if v.shape[:3] != q.shape[:3]:
+        raise ValueError("v must have shape [B,H,N,Dv]")
+    if query_chunk_size <= 0:
+        raise ValueError("query_chunk_size must be positive")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    bsz, heads, n, dim = q.shape
+    value_dim = v.shape[-1]
+    streams = bsz * heads
+    q3 = q.contiguous().view(streams, n, dim)
+    k3 = k.contiguous().view(streams, n, dim)
+    v3 = v.contiguous().view(streams, n, value_dim)
+    s = _attention_scale(scale, dim)
+    if stream_chunk_size is None:
+        stream_chunk_size = 16 if torch.is_grad_enabled() else streams
+    if stream_chunk_size <= 0:
+        raise ValueError("stream_chunk_size must be positive")
+
+    def compute_chunk(qc: Tensor, kc: Tensor, vc: Tensor) -> Tensor:
+        low_num, low_den, _ = low_degree_taylor_causal_sums_batched_stream(
+            qc,
+            kc,
+            vc,
+            degree=degree,
+            scale=s,
+        )
+        tail_num, tail_den, _ = _batched_article_residual_tail(
+            qc,
+            kc,
+            vc,
+            degree=degree,
+            block_size=block_size,
+            scale=s,
+            compressor=compressor,
+            query_chunk_size=query_chunk_size,
+        )
+        return (low_num + tail_num) / torch.clamp((low_den + tail_den)[:, :, None], min=denominator_eps)
+
+    if stream_chunk_size >= streams:
+        if torch.is_grad_enabled():
+            out3 = torch.utils.checkpoint.checkpoint(compute_chunk, q3, k3, v3, use_reentrant=False)
+        else:
+            out3 = compute_chunk(q3, k3, v3)
+    else:
+        out_chunks = []
+        for start in range(0, streams, stream_chunk_size):
+            end = min(start + stream_chunk_size, streams)
+            if torch.is_grad_enabled():
+                out_chunks.append(
+                    torch.utils.checkpoint.checkpoint(
+                        compute_chunk,
+                        q3[start:end],
+                        k3[start:end],
+                        v3[start:end],
+                        use_reentrant=False,
+                    )
+                )
+            else:
+                out_chunks.append(compute_chunk(q3[start:end], k3[start:end], v3[start:end]))
+        out3 = torch.cat(out_chunks, dim=0)
+    return out3.view(bsz, heads, n, value_dim)
+
+
 def fast_article_causal_attention(
     q: Tensor,
     k: Tensor,
@@ -668,6 +900,19 @@ def fast_article_causal_attention(
 
     bsz, heads, n, dim = q.shape
     value_dim = v.shape[-1]
+    if not return_stats:
+        return fast_article_causal_attention_batched(
+            q,
+            k,
+            v,
+            degree=degree,
+            block_size=block_size,
+            scale=scale,
+            compressor=compressor,
+            query_chunk_size=query_chunk_size,
+            denominator_eps=denominator_eps,
+        )
+
     out = torch.empty(bsz, heads, n, value_dim, device=q.device, dtype=q.dtype)
     stats_list: List[FastArticleStats] = []
 
