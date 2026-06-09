@@ -84,6 +84,13 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
+if attention_impl == 'fast_article':
+    if compile:
+        print("WARNING: disabling torch.compile for fast_article attention; this path is not Dynamo/Inductor friendly")
+        compile = False
+    if article_low_mode == 'auto':
+        print("WARNING: using article_low_mode='stream' for fast_article training to avoid large CUDA prefix tensors")
+        article_low_mode = 'stream'
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
