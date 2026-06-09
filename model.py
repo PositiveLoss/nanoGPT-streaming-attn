@@ -164,7 +164,7 @@ class GPTConfig:
     article_low_mode: str = 'auto' # 'auto', 'stream', or 'prefix'
     article_denominator_eps: float = 1e-12
     triton_compress_stride: int = 2
-    triton_backward: str = 'sdpa' # 'sdpa' or 'streaming'
+    triton_backward: str = 'sdpa' # 'sdpa', 'streaming', or 'triton'
 
 class GPT(nn.Module):
 

@@ -64,7 +64,7 @@ article_query_chunk_size = 2048
 article_low_mode = 'auto' # 'auto', 'stream', or 'prefix'
 article_denominator_eps = 1e-12
 triton_compress_stride = 2
-triton_backward = 'sdpa' # 'sdpa' or 'streaming'
+triton_backward = 'sdpa' # 'sdpa', 'streaming', or 'triton'
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations

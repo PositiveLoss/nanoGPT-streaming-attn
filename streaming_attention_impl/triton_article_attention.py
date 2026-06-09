@@ -440,9 +440,249 @@ if triton is not None and tl is not None:
             mask=(offs_m[:, None] < N) & (offs_dv[None, :] < DV),
         )
 
+
+    @triton.jit
+    def _flash_bwd_delta_kernel(
+        Q,
+        K,
+        V,
+        DO,
+        DELTA,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        DV: tl.constexpr,
+        SCALE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_DV: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_bh = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        offs_dv = tl.arange(0, BLOCK_DV)
+
+        q = tl.load(
+            Q + pid_bh * N * D + offs_m[:, None] * D + offs_d[None, :],
+            mask=(offs_m[:, None] < N) & (offs_d[None, :] < D),
+            other=0.0,
+        ).to(tl.float32)
+        do = tl.load(
+            DO + pid_bh * N * DV + offs_m[:, None] * DV + offs_dv[None, :],
+            mask=(offs_m[:, None] < N) & (offs_dv[None, :] < DV),
+            other=0.0,
+        ).to(tl.float32)
+
+        m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+        l_i = tl.zeros((BLOCK_M,), tl.float32)
+        delta_i = tl.zeros((BLOCK_M,), tl.float32)
+
+        for start_n in tl.range(0, N, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            k = tl.load(
+                K + pid_bh * N * D + offs_n[:, None] * D + offs_d[None, :],
+                mask=(offs_n[:, None] < N) & (offs_d[None, :] < D),
+                other=0.0,
+            ).to(tl.float32)
+            v = tl.load(
+                V + pid_bh * N * DV + offs_n[:, None] * DV + offs_dv[None, :],
+                mask=(offs_n[:, None] < N) & (offs_dv[None, :] < DV),
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.dot(q, tl.trans(k), input_precision="tf32") * SCALE
+            causal = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < N) & (offs_m[:, None] < N)
+            scores = tl.where(causal, scores, -float("inf"))
+
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            dp = tl.dot(do, tl.trans(v), input_precision="tf32")
+            delta_i = delta_i * alpha + tl.sum(p * dp, axis=1)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
+
+        delta_i = delta_i / tl.maximum(l_i, 1.0e-20)
+        tl.store(DELTA + pid_bh * N + offs_m, delta_i, mask=offs_m < N)
+
+
+    @triton.jit
+    def _flash_bwd_dq_kernel(
+        Q,
+        K,
+        V,
+        DO,
+        DELTA,
+        DQ,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        DV: tl.constexpr,
+        SCALE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_DV: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_bh = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        offs_dv = tl.arange(0, BLOCK_DV)
+
+        q = tl.load(
+            Q + pid_bh * N * D + offs_m[:, None] * D + offs_d[None, :],
+            mask=(offs_m[:, None] < N) & (offs_d[None, :] < D),
+            other=0.0,
+        ).to(tl.float32)
+        do = tl.load(
+            DO + pid_bh * N * DV + offs_m[:, None] * DV + offs_dv[None, :],
+            mask=(offs_m[:, None] < N) & (offs_dv[None, :] < DV),
+            other=0.0,
+        ).to(tl.float32)
+        delta = tl.load(DELTA + pid_bh * N + offs_m, mask=offs_m < N, other=0.0).to(tl.float32)
+
+        m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+        l_i = tl.zeros((BLOCK_M,), tl.float32)
+        for start_n in tl.range(0, N, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            k = tl.load(
+                K + pid_bh * N * D + offs_n[:, None] * D + offs_d[None, :],
+                mask=(offs_n[:, None] < N) & (offs_d[None, :] < D),
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.dot(q, tl.trans(k), input_precision="tf32") * SCALE
+            causal = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < N) & (offs_m[:, None] < N)
+            scores = tl.where(causal, scores, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
+
+        dq = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+        for start_n in tl.range(0, N, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            k = tl.load(
+                K + pid_bh * N * D + offs_n[:, None] * D + offs_d[None, :],
+                mask=(offs_n[:, None] < N) & (offs_d[None, :] < D),
+                other=0.0,
+            ).to(tl.float32)
+            v = tl.load(
+                V + pid_bh * N * DV + offs_n[:, None] * DV + offs_dv[None, :],
+                mask=(offs_n[:, None] < N) & (offs_dv[None, :] < DV),
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.dot(q, tl.trans(k), input_precision="tf32") * SCALE
+            causal = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < N) & (offs_m[:, None] < N)
+            scores = tl.where(causal, scores, -float("inf"))
+            p = tl.exp(scores - m_i[:, None]) / tl.maximum(l_i[:, None], 1.0e-20)
+            dp = tl.dot(do, tl.trans(v), input_precision="tf32")
+            ds = p * (dp - delta[:, None])
+            dq += tl.dot(ds, k, input_precision="tf32") * SCALE
+
+        tl.store(
+            DQ + pid_bh * N * D + offs_m[:, None] * D + offs_d[None, :],
+            dq,
+            mask=(offs_m[:, None] < N) & (offs_d[None, :] < D),
+        )
+
+
+    @triton.jit
+    def _flash_bwd_dkv_kernel(
+        Q,
+        K,
+        V,
+        DO,
+        DELTA,
+        DK,
+        DV_OUT,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        DV: tl.constexpr,
+        SCALE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_DV: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_bh = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m_base = tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        offs_dv = tl.arange(0, BLOCK_DV)
+
+        k = tl.load(
+            K + pid_bh * N * D + offs_n[:, None] * D + offs_d[None, :],
+            mask=(offs_n[:, None] < N) & (offs_d[None, :] < D),
+            other=0.0,
+        ).to(tl.float32)
+        v = tl.load(
+            V + pid_bh * N * DV + offs_n[:, None] * DV + offs_dv[None, :],
+            mask=(offs_n[:, None] < N) & (offs_dv[None, :] < DV),
+            other=0.0,
+        ).to(tl.float32)
+        dk = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        dv_acc = tl.zeros((BLOCK_N, BLOCK_DV), tl.float32)
+
+        for start_m in tl.range(0, N, BLOCK_M):
+            offs_m = start_m + offs_m_base
+            q = tl.load(
+                Q + pid_bh * N * D + offs_m[:, None] * D + offs_d[None, :],
+                mask=(offs_m[:, None] < N) & (offs_d[None, :] < D),
+                other=0.0,
+            ).to(tl.float32)
+            do = tl.load(
+                DO + pid_bh * N * DV + offs_m[:, None] * DV + offs_dv[None, :],
+                mask=(offs_m[:, None] < N) & (offs_dv[None, :] < DV),
+                other=0.0,
+            ).to(tl.float32)
+            delta = tl.load(DELTA + pid_bh * N + offs_m, mask=offs_m < N, other=0.0).to(tl.float32)
+
+            m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+            l_i = tl.zeros((BLOCK_M,), tl.float32)
+            for s in tl.range(0, N, BLOCK_N):
+                offs_s = s + tl.arange(0, BLOCK_N)
+                kk = tl.load(
+                    K + pid_bh * N * D + offs_s[:, None] * D + offs_d[None, :],
+                    mask=(offs_s[:, None] < N) & (offs_d[None, :] < D),
+                    other=0.0,
+                ).to(tl.float32)
+                scores_all = tl.dot(q, tl.trans(kk), input_precision="tf32") * SCALE
+                causal_all = (offs_s[None, :] <= offs_m[:, None]) & (offs_s[None, :] < N) & (offs_m[:, None] < N)
+                scores_all = tl.where(causal_all, scores_all, -float("inf"))
+                m_new = tl.maximum(m_i, tl.max(scores_all, axis=1))
+                alpha = tl.exp(m_i - m_new)
+                p_all = tl.exp(scores_all - m_new[:, None])
+                l_i = l_i * alpha + tl.sum(p_all, axis=1)
+                m_i = m_new
+
+            scores = tl.dot(q, tl.trans(k), input_precision="tf32") * SCALE
+            causal = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < N) & (offs_m[:, None] < N)
+            scores = tl.where(causal, scores, -float("inf"))
+            p = tl.exp(scores - m_i[:, None]) / tl.maximum(l_i[:, None], 1.0e-20)
+            dp = tl.dot(do, tl.trans(v), input_precision="tf32")
+            ds = p * (dp - delta[:, None])
+            dk += tl.dot(tl.trans(ds), q, input_precision="tf32") * SCALE
+            dv_acc += tl.dot(tl.trans(p), do, input_precision="tf32")
+
+        tl.store(
+            DK + pid_bh * N * D + offs_n[:, None] * D + offs_d[None, :],
+            dk,
+            mask=(offs_n[:, None] < N) & (offs_d[None, :] < D),
+        )
+        tl.store(
+            DV_OUT + pid_bh * N * DV + offs_n[:, None] * DV + offs_dv[None, :],
+            dv_acc,
+            mask=(offs_n[:, None] < N) & (offs_dv[None, :] < DV),
+        )
+
 else:  # pragma: no cover - only used when Triton is unavailable.
     _article_direct_kernel = None
     _flash_causal_kernel = None
+    _flash_bwd_delta_kernel = None
+    _flash_bwd_dq_kernel = None
+    _flash_bwd_dkv_kernel = None
 
 
 # -----------------------------------------------------------------------------
@@ -525,9 +765,9 @@ def triton_article_causal_attention(
     )
     r = rep_k.shape[1]
 
-    block_d = _next_power_of_2(dim)
+    block_d = max(16, _next_power_of_2(dim))
     if value_block is None:
-        block_dv = min(64, _next_power_of_2(dv))
+        block_dv = min(64, max(16, _next_power_of_2(dv)))
     else:
         block_dv = _next_power_of_2(value_block)
     block_dv = max(1, min(block_dv, 256))
@@ -613,9 +853,9 @@ def triton_flash_causal_attention(
     q3 = q3.contiguous()
     k3 = k3.contiguous()
     v3 = v3.contiguous()
-    block_d = _next_power_of_2(dim)
+    block_d = max(16, _next_power_of_2(dim))
     if value_block is None:
-        block_dv = min(64, _next_power_of_2(dv))
+        block_dv = min(64, max(16, _next_power_of_2(dv)))
     else:
         block_dv = _next_power_of_2(value_block)
     block_dv = max(1, min(block_dv, 256))
@@ -641,6 +881,119 @@ def triton_flash_causal_attention(
         num_stages=3,
     )
     return _unflatten_output(out3, original_shape, had_bh)
+
+
+def triton_flash_causal_attention_backward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    grad_out: Tensor,
+    *,
+    scale: Optional[float] = None,
+    block_m: int = 16,
+    block_n: int = 64,
+    value_block: Optional[int] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Fused Triton backward for exact causal-attention surrogate gradients."""
+    _require_triton()
+    _require_cuda(q, k, v, grad_out)
+    q3, k3, v3, original_shape, had_bh = _flatten_bh_qkv(q, k, v)
+    if grad_out.ndim == 2:
+        grad3 = grad_out[None, :, :].contiguous()
+    elif grad_out.ndim == 4:
+        b, h, n_go, dv_go = grad_out.shape
+        grad3 = grad_out.contiguous().view(b * h, n_go, dv_go)
+    else:
+        raise ValueError("grad_out must be [N,Dv] or [B,H,N,Dv]")
+
+    bh, n, dim = q3.shape
+    dv = v3.shape[-1]
+    if dim > 128:
+        raise ValueError("this compact backward supports D <= 128")
+    if dv > 64:
+        raise ValueError("this compact backward currently supports Dv <= 64")
+
+    q3 = q3.contiguous()
+    k3 = k3.contiguous()
+    v3 = v3.contiguous()
+    grad3 = grad3.contiguous()
+    dq3 = torch.empty_like(q3)
+    dk3 = torch.empty_like(k3)
+    dv3 = torch.empty_like(v3)
+    delta = torch.empty(bh, n, device=q3.device, dtype=torch.float32)
+
+    block_d = max(16, _next_power_of_2(dim))
+    if value_block is None:
+        block_dv = min(64, max(16, _next_power_of_2(dv)))
+    else:
+        block_dv = max(16, _next_power_of_2(value_block))
+    block_dv = max(16, min(block_dv, 64))
+    s = _attention_scale(scale, dim)
+
+    assert _flash_bwd_delta_kernel is not None
+    assert _flash_bwd_dq_kernel is not None
+    assert _flash_bwd_dkv_kernel is not None
+    grid_q = (_ceil_div(n, block_m), bh)
+    grid_k = (_ceil_div(n, block_n), bh)
+    _flash_bwd_delta_kernel[grid_q](
+        q3,
+        k3,
+        v3,
+        grad3,
+        delta,
+        N=n,
+        D=dim,
+        DV=dv,
+        SCALE=s,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        BLOCK_DV=block_dv,
+        num_warps=4,
+        num_stages=3,
+    )
+    _flash_bwd_dq_kernel[grid_q](
+        q3,
+        k3,
+        v3,
+        grad3,
+        delta,
+        dq3,
+        N=n,
+        D=dim,
+        DV=dv,
+        SCALE=s,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        BLOCK_DV=block_dv,
+        num_warps=4,
+        num_stages=3,
+    )
+    _flash_bwd_dkv_kernel[grid_k](
+        q3,
+        k3,
+        v3,
+        grad3,
+        delta,
+        dk3,
+        dv3,
+        N=n,
+        D=dim,
+        DV=dv,
+        SCALE=s,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        BLOCK_DV=block_dv,
+        num_warps=4,
+        num_stages=3,
+    )
+    return (
+        _unflatten_output(dq3, original_shape, had_bh),
+        _unflatten_output(dk3, original_shape, had_bh),
+        _unflatten_output(dv3, original_shape, had_bh),
+    )
 
 
 def _torch_segment_mean_article_attention(
@@ -736,8 +1089,8 @@ class _TrainableTritonArticleAttention(torch.autograd.Function):
         ctx.compress_stride = int(compress_stride)
         ctx.denominator_eps = float(denominator_eps)
         ctx.backward_impl = str(backward_impl)
-        if ctx.backward_impl not in {"sdpa", "streaming"}:
-            raise ValueError("triton backward_impl must be 'sdpa' or 'streaming'")
+        if ctx.backward_impl not in {"sdpa", "streaming", "triton"}:
+            raise ValueError("triton backward_impl must be 'sdpa', 'streaming', or 'triton'")
         return triton_article_causal_attention(
             q,
             k,
@@ -752,6 +1105,10 @@ class _TrainableTritonArticleAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: Tensor):
         q, k, v = ctx.saved_tensors
+        if ctx.backward_impl == "triton":
+            grad_q, grad_k, grad_v = triton_flash_causal_attention_backward(q, k, v, grad_out)
+            return grad_q, grad_k, grad_v, None, None, None, None, None
+
         if ctx.backward_impl == "sdpa":
             with torch.enable_grad():
                 q_req = q.detach().requires_grad_(True)
