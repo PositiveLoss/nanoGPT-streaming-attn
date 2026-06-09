@@ -85,6 +85,11 @@ elif init_from.startswith('gpt2'):
 model.eval()
 model.to(device)
 print(f"Using attention_impl={model.config.attention_impl}")
+if model.config.attention_impl == 'fast_article' and model.config.article_low_mode == 'auto':
+    print("WARNING: using article_low_mode='stream' for fast_article sampling to avoid large CUDA prefix tensors")
+    model.config.article_low_mode = 'stream'
+    for block in model.transformer.h:
+        block.attn.article_low_mode = 'stream'
 if model.config.attention_impl in {'fast_article', 'triton_article'} and compile:
     print(f"WARNING: disabling torch.compile for {model.config.attention_impl} attention during sampling")
     compile = False
