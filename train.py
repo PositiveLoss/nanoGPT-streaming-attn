@@ -55,7 +55,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # attention implementation
-attention_impl = 'flash' # 'flash', 'manual', or 'fast_article'
+attention_impl = 'flash' # 'flash', 'manual', 'fast_article', or 'triton_article'
 article_degree = 2
 article_block_size = 128
 article_compressor = 'sorted_pair' # 'sorted_pair', 'random', or 'none'
@@ -63,6 +63,7 @@ article_seed = 0
 article_query_chunk_size = 2048
 article_low_mode = 'auto' # 'auto', 'stream', or 'prefix'
 article_denominator_eps = 1e-12
+triton_compress_stride = 2
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -84,10 +85,11 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
-if attention_impl == 'fast_article':
+if attention_impl in {'fast_article', 'triton_article'}:
     if compile:
-        print("WARNING: disabling torch.compile for fast_article attention; this path is not Dynamo/Inductor friendly")
+        print(f"WARNING: disabling torch.compile for {attention_impl} attention; this path is not Dynamo/Inductor friendly")
         compile = False
+if attention_impl == 'fast_article':
     if article_low_mode == 'auto':
         print("WARNING: using article_low_mode='stream' for fast_article training to avoid large CUDA prefix tensors")
         article_low_mode = 'stream'
@@ -165,7 +167,8 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   article_degree=article_degree, article_block_size=article_block_size,
                   article_compressor=article_compressor, article_seed=article_seed,
                   article_query_chunk_size=article_query_chunk_size, article_low_mode=article_low_mode,
-                  article_denominator_eps=article_denominator_eps) # start with model_args from command line
+                  article_denominator_eps=article_denominator_eps,
+                  triton_compress_stride=triton_compress_stride) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -211,6 +214,7 @@ elif init_from.startswith('gpt2'):
         article_query_chunk_size=article_query_chunk_size,
         article_low_mode=article_low_mode,
         article_denominator_eps=article_denominator_eps,
+        triton_compress_stride=triton_compress_stride,
     )
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly

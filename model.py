@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from streaming_attention_impl.fast_article_attention import fast_article_causal_attention
+from streaming_attention_impl.triton_article_attention import trainable_triton_article_causal_attention
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -51,8 +52,9 @@ class CausalSelfAttention(nn.Module):
         self.article_query_chunk_size = config.article_query_chunk_size
         self.article_low_mode = config.article_low_mode
         self.article_denominator_eps = config.article_denominator_eps
-        if self.attention_impl not in {'flash', 'manual', 'fast_article'}:
-            raise ValueError("attention_impl must be one of {'flash', 'manual', 'fast_article'}")
+        self.triton_compress_stride = config.triton_compress_stride
+        if self.attention_impl not in {'flash', 'manual', 'fast_article', 'triton_article'}:
+            raise ValueError("attention_impl must be one of {'flash', 'manual', 'fast_article', 'triton_article'}")
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = self.attention_impl == 'flash' and hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         needs_manual_mask = self.attention_impl == 'manual' or (self.attention_impl == 'flash' and not self.flash)
@@ -84,6 +86,16 @@ class CausalSelfAttention(nn.Module):
                 seed=self.article_seed,
                 query_chunk_size=self.article_query_chunk_size,
                 low_mode=self.article_low_mode,
+                denominator_eps=self.article_denominator_eps,
+            )
+        elif self.attention_impl == 'triton_article':
+            y = trainable_triton_article_causal_attention(
+                q,
+                k,
+                v,
+                degree=self.article_degree,
+                block_size=self.article_block_size,
+                compress_stride=self.triton_compress_stride,
                 denominator_eps=self.article_denominator_eps,
             )
         elif self.flash:
@@ -141,7 +153,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    attention_impl: str = 'flash' # 'flash', 'manual', or 'fast_article'
+    attention_impl: str = 'flash' # 'flash', 'manual', 'fast_article', or 'triton_article'
     article_degree: int = 2
     article_block_size: int = 128
     article_compressor: str = 'sorted_pair' # 'sorted_pair', 'random', or 'none'
@@ -149,6 +161,7 @@ class GPTConfig:
     article_query_chunk_size: int = 2048
     article_low_mode: str = 'auto' # 'auto', 'stream', or 'prefix'
     article_denominator_eps: float = 1e-12
+    triton_compress_stride: int = 2
 
 class GPT(nn.Module):
 
@@ -243,7 +256,7 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # runtime attention settings can be overridden along with dropout
-        allowed_override_args = {'dropout', 'attention_impl', 'article_degree', 'article_block_size', 'article_compressor', 'article_seed', 'article_query_chunk_size', 'article_low_mode', 'article_denominator_eps'}
+        allowed_override_args = {'dropout', 'attention_impl', 'article_degree', 'article_block_size', 'article_compressor', 'article_seed', 'article_query_chunk_size', 'article_low_mode', 'article_denominator_eps', 'triton_compress_stride'}
         assert all(k in allowed_override_args for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)

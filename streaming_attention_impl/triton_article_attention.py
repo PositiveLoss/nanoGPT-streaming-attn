@@ -54,6 +54,11 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from streaming_attention_impl.fast_article_attention import (
+    exp_taylor,
+    low_degree_taylor_causal_sums,
+)
+
 try:  # Optional so the file can still be imported on CPU-only machines.
     import triton
     import triton.language as tl
@@ -635,6 +640,155 @@ def triton_flash_causal_attention(
         num_stages=3,
     )
     return _unflatten_output(out3, original_shape, had_bh)
+
+
+def _torch_segment_mean_article_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    degree: int = 2,
+    block_size: int = 128,
+    compress_stride: int = 2,
+    scale: Optional[float] = None,
+    denominator_eps: float = 1.0e-12,
+) -> Tensor:
+    """Differentiable PyTorch surrogate matching the Triton article formula."""
+    if block_size <= 0 or compress_stride <= 0:
+        raise ValueError("block_size and compress_stride must be positive")
+    if block_size % compress_stride != 0:
+        raise ValueError("block_size must be divisible by compress_stride")
+
+    q3, k3, v3, original_shape, had_bh = _flatten_bh_qkv(q, k, v)
+    bh, n, dim = q3.shape
+    dv = v3.shape[-1]
+    s = _attention_scale(scale, dim)
+    reps_per_block = block_size // compress_stride
+    completed_blocks = max(0, (n - 1) // block_size)
+    query_pos = torch.arange(n, device=q3.device)
+    out = torch.empty(bh, n, dv, device=q3.device, dtype=q3.dtype)
+
+    for seq in range(bh):
+        qq = q3[seq]
+        kk = k3[seq]
+        vv = v3[seq]
+        low_num, low_den, _ = low_degree_taylor_causal_sums(
+            qq,
+            kk,
+            vv,
+            degree=degree,
+            scale=s,
+            mode="stream",
+        )
+
+        tail_den = torch.zeros(n, device=q3.device, dtype=q3.dtype)
+        tail_num = torch.zeros(n, dv, device=q3.device, dtype=q3.dtype)
+
+        for start in range(0, n, block_size):
+            end = min(start + block_size, n)
+            bs = end - start
+            logits = (qq[start:end] @ kk[start:end].T) * s
+            residual = torch.exp(torch.clamp(logits, max=80.0)) - exp_taylor(logits, degree)
+            causal = torch.ones(bs, bs, device=q3.device, dtype=torch.bool).tril()
+            residual = residual.masked_fill(~causal, 0.0)
+            tail_den[start:end] = tail_den[start:end] + residual.sum(dim=-1)
+            tail_num[start:end] = tail_num[start:end] + residual @ vv[start:end]
+
+        if completed_blocks > 0:
+            usable = completed_blocks * block_size
+            rep_k = kk[:usable].reshape(completed_blocks, reps_per_block, compress_stride, dim).mean(dim=2)
+            rep_v = vv[:usable].reshape(completed_blocks, reps_per_block, compress_stride, dv).mean(dim=2)
+            rep_k = rep_k.reshape(completed_blocks * reps_per_block, dim)
+            rep_v = rep_v.reshape(completed_blocks * reps_per_block, dv)
+            rep_block = torch.arange(rep_k.shape[0], device=q3.device) // reps_per_block
+            active_from = (rep_block + 1) * block_size
+            logits = (qq @ rep_k.T) * s
+            residual = torch.exp(torch.clamp(logits, max=80.0)) - exp_taylor(logits, degree)
+            active = query_pos[:, None] >= active_from[None, :]
+            residual = residual.masked_fill(~active, 0.0) * float(compress_stride)
+            tail_den = tail_den + residual.sum(dim=-1)
+            tail_num = tail_num + residual @ rep_v
+
+        den = low_den + tail_den
+        num = low_num + tail_num
+        out[seq] = num / torch.clamp(den[:, None], min=denominator_eps)
+
+    return _unflatten_output(out, original_shape, had_bh)
+
+
+class _TrainableTritonArticleAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        degree: int,
+        block_size: int,
+        compress_stride: int,
+        denominator_eps: float,
+    ) -> Tensor:
+        ctx.save_for_backward(q, k, v)
+        ctx.degree = int(degree)
+        ctx.block_size = int(block_size)
+        ctx.compress_stride = int(compress_stride)
+        ctx.denominator_eps = float(denominator_eps)
+        return triton_article_causal_attention(
+            q,
+            k,
+            v,
+            degree=ctx.degree,
+            block_size=ctx.block_size,
+            compress_stride=ctx.compress_stride,
+            denominator_eps=ctx.denominator_eps,
+            output_dtype=q.dtype,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        q, k, v = ctx.saved_tensors
+        with torch.enable_grad():
+            q_req = q.detach().requires_grad_(True)
+            k_req = k.detach().requires_grad_(True)
+            v_req = v.detach().requires_grad_(True)
+            surrogate = _torch_segment_mean_article_attention(
+                q_req,
+                k_req,
+                v_req,
+                degree=ctx.degree,
+                block_size=ctx.block_size,
+                compress_stride=ctx.compress_stride,
+                denominator_eps=ctx.denominator_eps,
+            )
+            grad_q, grad_k, grad_v = torch.autograd.grad(
+                surrogate,
+                (q_req, k_req, v_req),
+                grad_out,
+                allow_unused=True,
+            )
+        return grad_q, grad_k, grad_v, None, None, None, None
+
+
+def trainable_triton_article_causal_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    degree: int = 2,
+    block_size: int = 128,
+    compress_stride: int = 2,
+    denominator_eps: float = 1.0e-12,
+) -> Tensor:
+    """Triton article forward with a differentiable PyTorch surrogate backward."""
+    return _TrainableTritonArticleAttention.apply(
+        q,
+        k,
+        v,
+        degree,
+        block_size,
+        compress_stride,
+        denominator_eps,
+    )
 
 
 # -----------------------------------------------------------------------------
