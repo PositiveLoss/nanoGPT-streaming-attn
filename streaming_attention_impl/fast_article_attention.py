@@ -326,6 +326,35 @@ def low_degree_taylor_causal_sums_batched_stream(
     return torch.stack(low_num_steps, dim=1), torch.stack(low_den_steps, dim=1), feature_count
 
 
+def low_degree_taylor_causal_sums_batched_prefix(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    degree: int = 2,
+    scale: Optional[float] = None,
+) -> Tuple[Tensor, Tensor, int]:
+    """Exact causal Taylor sums for [M,N,D] tensors using prefix tensors."""
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("low_degree_taylor_causal_sums_batched_prefix expects [M,N,D], [M,N,D], [M,N,Dv]")
+    if q.shape != k.shape or v.shape[:2] != k.shape[:2]:
+        raise ValueError("q/k must match and v must share [M,N]")
+
+    _, _, dim = q.shape
+    s = _attention_scale(scale, dim)
+    q_eff = q * s
+
+    f_key = _taylor_features_degree012(k, degree, key_side=True)
+    f_query = _taylor_features_degree012(q_eff, degree, key_side=False)
+    feature_count = int(f_key.shape[-1])
+
+    prefix_key = f_key.cumsum(dim=1)
+    low_den = (f_query * prefix_key).sum(dim=-1)
+    prefix_key_value = (f_key[:, :, :, None] * v[:, :, None, :]).cumsum(dim=1)
+    low_num = (f_query[:, :, :, None] * prefix_key_value).sum(dim=2)
+    return low_num, low_den, feature_count
+
+
 # -----------------------------------------------------------------------------
 # Fast block residual coreset
 # -----------------------------------------------------------------------------
@@ -778,6 +807,7 @@ def fast_article_causal_attention_batched(
     scale: Optional[float] = None,
     compressor: str = "sorted_pair",
     query_chunk_size: int = 2048,
+    low_mode: str = "auto",
     stream_chunk_size: Optional[int] = None,
     denominator_eps: float = 1e-12,
 ) -> Tensor:
@@ -810,14 +840,29 @@ def fast_article_causal_attention_batched(
     if stream_chunk_size <= 0:
         raise ValueError("stream_chunk_size must be positive")
 
+    resolved_low_mode = low_mode
+    if resolved_low_mode == "auto":
+        resolved_low_mode = "stream" if torch.is_grad_enabled() else ("prefix" if q.device.type == "cuda" else "stream")
+
     def compute_chunk(qc: Tensor, kc: Tensor, vc: Tensor) -> Tensor:
-        low_num, low_den, _ = low_degree_taylor_causal_sums_batched_stream(
-            qc,
-            kc,
-            vc,
-            degree=degree,
-            scale=s,
-        )
+        if resolved_low_mode == "prefix":
+            low_num, low_den, _ = low_degree_taylor_causal_sums_batched_prefix(
+                qc,
+                kc,
+                vc,
+                degree=degree,
+                scale=s,
+            )
+        elif resolved_low_mode == "stream":
+            low_num, low_den, _ = low_degree_taylor_causal_sums_batched_stream(
+                qc,
+                kc,
+                vc,
+                degree=degree,
+                scale=s,
+            )
+        else:
+            raise ValueError("low_mode must be one of {'auto', 'stream', 'prefix'}")
         tail_num, tail_den, _ = _batched_article_residual_tail(
             qc,
             kc,
@@ -910,6 +955,7 @@ def fast_article_causal_attention(
             scale=scale,
             compressor=compressor,
             query_chunk_size=query_chunk_size,
+            low_mode=low_mode,
             denominator_eps=denominator_eps,
         )
 

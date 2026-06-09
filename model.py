@@ -16,7 +16,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from streaming_attention_impl.fast_article_attention import fast_article_causal_attention
-from streaming_attention_impl.triton_article_attention import trainable_triton_article_causal_attention
+from streaming_attention_impl.triton_article_attention import (
+    trainable_triton_article_causal_attention,
+    triton_article_causal_attention,
+)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -90,16 +93,28 @@ class CausalSelfAttention(nn.Module):
                 denominator_eps=self.article_denominator_eps,
             )
         elif self.attention_impl == 'triton_article':
-            y = trainable_triton_article_causal_attention(
-                q,
-                k,
-                v,
-                degree=self.article_degree,
-                block_size=self.article_block_size,
-                compress_stride=self.triton_compress_stride,
-                denominator_eps=self.article_denominator_eps,
-                backward_impl=self.triton_backward,
-            )
+            if self.training and torch.is_grad_enabled():
+                y = trainable_triton_article_causal_attention(
+                    q,
+                    k,
+                    v,
+                    degree=self.article_degree,
+                    block_size=self.article_block_size,
+                    compress_stride=self.triton_compress_stride,
+                    denominator_eps=self.article_denominator_eps,
+                    backward_impl=self.triton_backward,
+                )
+            else:
+                y = triton_article_causal_attention(
+                    q,
+                    k,
+                    v,
+                    degree=self.article_degree,
+                    block_size=self.article_block_size,
+                    compress_stride=self.triton_compress_stride,
+                    denominator_eps=self.article_denominator_eps,
+                    output_dtype=q.dtype,
+                )
         elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)

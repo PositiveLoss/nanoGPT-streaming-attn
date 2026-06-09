@@ -20,8 +20,38 @@ seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
+attention_impl = 'checkpoint' # checkpoint/default, or 'flash', 'manual', 'fast_article', 'triton_article'
+article_degree = 2
+article_block_size = 128
+article_compressor = 'sorted_pair'
+article_seed = 0
+article_query_chunk_size = 2048
+article_low_mode = 'auto'
+article_denominator_eps = 1e-12
+triton_compress_stride = 2
+triton_backward = 'sdpa'
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
+
+def apply_attention_overrides(model_args):
+    if attention_impl == 'checkpoint':
+        return model_args
+    overrides = {
+        'attention_impl': attention_impl,
+        'article_degree': article_degree,
+        'article_block_size': article_block_size,
+        'article_compressor': article_compressor,
+        'article_seed': article_seed,
+        'article_query_chunk_size': article_query_chunk_size,
+        'article_low_mode': article_low_mode,
+        'article_denominator_eps': article_denominator_eps,
+        'triton_compress_stride': triton_compress_stride,
+        'triton_backward': triton_backward,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            model_args[key] = value
+    return model_args
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -36,7 +66,8 @@ if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
+    model_args = apply_attention_overrides(dict(checkpoint['model_args']))
+    gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
@@ -46,10 +77,15 @@ if init_from == 'resume':
     model.load_state_dict(state_dict)
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+    override_args = apply_attention_overrides(dict(dropout=0.0))
+    model = GPT.from_pretrained(init_from, override_args)
 
 model.eval()
 model.to(device)
+print(f"Using attention_impl={model.config.attention_impl}")
+if model.config.attention_impl in {'fast_article', 'triton_article'} and compile:
+    print(f"WARNING: disabling torch.compile for {model.config.attention_impl} attention during sampling")
+    compile = False
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
