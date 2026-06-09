@@ -58,6 +58,8 @@ torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+if device_type == 'cuda':
+    torch.cuda.reset_peak_memory_stats(device)
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
@@ -123,3 +125,17 @@ with torch.no_grad():
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
             print('---------------')
+
+if device_type == 'cuda':
+    torch.cuda.synchronize(device)
+    allocated = torch.cuda.memory_allocated(device) / 1024**2
+    reserved = torch.cuda.memory_reserved(device) / 1024**2
+    peak_allocated = torch.cuda.max_memory_allocated(device) / 1024**2
+    peak_reserved = torch.cuda.max_memory_reserved(device) / 1024**2
+    print(
+        "GPU memory: "
+        f"allocated={allocated:.2f} MiB, "
+        f"reserved={reserved:.2f} MiB, "
+        f"peak_allocated={peak_allocated:.2f} MiB, "
+        f"peak_reserved={peak_reserved:.2f} MiB"
+    )
