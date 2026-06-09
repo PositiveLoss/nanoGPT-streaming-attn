@@ -53,6 +53,7 @@ class CausalSelfAttention(nn.Module):
         self.article_low_mode = config.article_low_mode
         self.article_denominator_eps = config.article_denominator_eps
         self.triton_compress_stride = config.triton_compress_stride
+        self.triton_backward = config.triton_backward
         if self.attention_impl not in {'flash', 'manual', 'fast_article', 'triton_article'}:
             raise ValueError("attention_impl must be one of {'flash', 'manual', 'fast_article', 'triton_article'}")
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
@@ -97,6 +98,7 @@ class CausalSelfAttention(nn.Module):
                 block_size=self.article_block_size,
                 compress_stride=self.triton_compress_stride,
                 denominator_eps=self.article_denominator_eps,
+                backward_impl=self.triton_backward,
             )
         elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -162,6 +164,7 @@ class GPTConfig:
     article_low_mode: str = 'auto' # 'auto', 'stream', or 'prefix'
     article_denominator_eps: float = 1e-12
     triton_compress_stride: int = 2
+    triton_backward: str = 'sdpa' # 'sdpa' or 'streaming'
 
 class GPT(nn.Module):
 
@@ -256,7 +259,7 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # runtime attention settings can be overridden along with dropout
-        allowed_override_args = {'dropout', 'attention_impl', 'article_degree', 'article_block_size', 'article_compressor', 'article_seed', 'article_query_chunk_size', 'article_low_mode', 'article_denominator_eps', 'triton_compress_stride'}
+        allowed_override_args = {'dropout', 'attention_impl', 'article_degree', 'article_block_size', 'article_compressor', 'article_seed', 'article_query_chunk_size', 'article_low_mode', 'article_denominator_eps', 'triton_compress_stride', 'triton_backward'}
         assert all(k in allowed_override_args for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)

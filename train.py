@@ -64,6 +64,7 @@ article_query_chunk_size = 2048
 article_low_mode = 'auto' # 'auto', 'stream', or 'prefix'
 article_denominator_eps = 1e-12
 triton_compress_stride = 2
+triton_backward = 'sdpa' # 'sdpa' or 'streaming'
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -168,7 +169,8 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   article_compressor=article_compressor, article_seed=article_seed,
                   article_query_chunk_size=article_query_chunk_size, article_low_mode=article_low_mode,
                   article_denominator_eps=article_denominator_eps,
-                  triton_compress_stride=triton_compress_stride) # start with model_args from command line
+                  triton_compress_stride=triton_compress_stride,
+                  triton_backward=triton_backward) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -215,6 +217,7 @@ elif init_from.startswith('gpt2'):
         article_low_mode=article_low_mode,
         article_denominator_eps=article_denominator_eps,
         triton_compress_stride=triton_compress_stride,
+        triton_backward=triton_backward,
     )
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly

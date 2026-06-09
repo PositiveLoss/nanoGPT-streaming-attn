@@ -727,12 +727,16 @@ class _TrainableTritonArticleAttention(torch.autograd.Function):
         block_size: int,
         compress_stride: int,
         denominator_eps: float,
+        backward_impl: str,
     ) -> Tensor:
         ctx.save_for_backward(q, k, v)
         ctx.degree = int(degree)
         ctx.block_size = int(block_size)
         ctx.compress_stride = int(compress_stride)
         ctx.denominator_eps = float(denominator_eps)
+        ctx.backward_impl = str(backward_impl)
+        if ctx.backward_impl not in {"sdpa", "streaming"}:
+            raise ValueError("triton backward_impl must be 'sdpa' or 'streaming'")
         return triton_article_causal_attention(
             q,
             k,
@@ -747,6 +751,27 @@ class _TrainableTritonArticleAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: Tensor):
         q, k, v = ctx.saved_tensors
+        if ctx.backward_impl == "sdpa":
+            with torch.enable_grad():
+                q_req = q.detach().requires_grad_(True)
+                k_req = k.detach().requires_grad_(True)
+                v_req = v.detach().requires_grad_(True)
+                surrogate = torch.nn.functional.scaled_dot_product_attention(
+                    q_req,
+                    k_req,
+                    v_req,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=True,
+                )
+                grad_q, grad_k, grad_v = torch.autograd.grad(
+                    surrogate,
+                    (q_req, k_req, v_req),
+                    grad_out,
+                    allow_unused=True,
+                )
+            return grad_q, grad_k, grad_v, None, None, None, None, None
+
         q3, k3, v3, original_shape, had_bh = _flatten_bh_qkv(q, k, v)
         if had_bh:
             b, h, n, _ = original_shape
@@ -788,7 +813,7 @@ class _TrainableTritonArticleAttention(torch.autograd.Function):
         grad_q = _unflatten_output(grad_q3, original_shape, had_bh)
         grad_k = _unflatten_output(grad_k3, original_shape, had_bh)
         grad_v = _unflatten_output(grad_v3, original_shape, had_bh)
-        return grad_q, grad_k, grad_v, None, None, None, None
+        return grad_q, grad_k, grad_v, None, None, None, None, None
 
 
 def trainable_triton_article_causal_attention(
@@ -800,8 +825,9 @@ def trainable_triton_article_causal_attention(
     block_size: int = 128,
     compress_stride: int = 2,
     denominator_eps: float = 1.0e-12,
+    backward_impl: str = "sdpa",
 ) -> Tensor:
-    """Triton article forward with a differentiable PyTorch surrogate backward."""
+    """Triton article forward with a configurable surrogate backward."""
     return _TrainableTritonArticleAttention.apply(
         q,
         k,
@@ -810,6 +836,7 @@ def trainable_triton_article_causal_attention(
         block_size,
         compress_stride,
         denominator_eps,
+        backward_impl,
     )
 
 
